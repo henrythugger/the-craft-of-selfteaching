@@ -151,126 +151,56 @@ class Fantasy5Fetcher:
 
 class Lottery539Fetcher:
     """
-    從台灣彩券官網抓今彩539開獎歷史。
-    使用民國年（ROC +1911 = 西元年）。
+    從台灣彩券官方 JSON API 抓今彩539開獎歷史。
+    來源：https://github.com/stu01509/TaiwanLotteryCrawler
 
-    若官網改版導致爬蟲失敗，請手動把資料填入 data/lottery539.json
-    或至下方網址手動複製：
-    https://www.taiwanlottery.com.tw/Lotto/539/history.aspx
+    API：https://api.taiwanlottery.com/TLCAPIWeB/Lottery/Daily539Result
+         ?period&month=YYYY-MM&pageSize=31
     """
 
-    URL = "https://www.taiwanlottery.com.tw/Lotto/539/history.aspx"
+    API = "https://api.taiwanlottery.com/TLCAPIWeB/Lottery/Daily539Result"
 
     def fetch_recent(self, count: int = 30) -> list[dict]:
-        end   = date.today()
-        start = end - timedelta(days=count + 15)  # 多抓幾天，扣掉非開獎日
+        today = date.today()
+        draws: list[dict] = []
 
-        session = _session()
+        # 從本月往前推，每次查一個月，直到累積足夠期數
+        year, month = today.year, today.month
+        months_tried = 0
+
+        while len(draws) < count and months_tried < 6:
+            url = f"{self.API}?period&month={year}-{month:02d}&pageSize=31"
+            try:
+                r = _get(url)
+                r.raise_for_status()
+                data = r.json()
+                items = data.get("content", {}).get("daily539Res", [])
+                for item in items:
+                    d = self._parse(item)
+                    if d:
+                        draws.append(d)
+            except Exception as exc:
+                print(f"  [539] API 失敗 ({year}-{month:02d})：{exc}")
+
+            # 往前推一個月
+            month -= 1
+            if month == 0:
+                month = 12
+                year -= 1
+            months_tried += 1
+
+        # 依期號由新到舊排序
+        draws.sort(key=lambda x: x["period"], reverse=True)
+        return draws[:count]
+
+    def _parse(self, item: dict) -> dict | None:
         try:
-            # Step 1: GET 取得 ASP.NET 隱藏欄位
-            get_kw = {"impersonate": _IMPERSONATE} if _USE_CFFI else {}
-            r = session.get(self.URL, headers=_HEADERS, timeout=15, **get_kw)
-            r.raise_for_status()
-            soup = BeautifulSoup(r.text, "lxml")
-
-            roc_y1 = start.year - 1911
-            roc_y2 = end.year   - 1911
-
-            # Step 2: 建立 POST 資料（欄位名稱依官網 form 控制項）
-            post_data = {
-                "__VIEWSTATE":          self._field(soup, "__VIEWSTATE"),
-                "__VIEWSTATEGENERATOR": self._field(soup, "__VIEWSTATEGENERATOR"),
-                "__EVENTVALIDATION":    self._field(soup, "__EVENTVALIDATION"),
-                # 開始日期
-                "D539Control_history1$dropYear":   str(roc_y1),
-                "D539Control_history1$dropMonth":  str(start.month),
-                "D539Control_history1$startDay":   str(start.day),
-                # 結束日期
-                "D539Control_history1$dropYear2":  str(roc_y2),
-                "D539Control_history1$dropMonth2": str(end.month),
-                "D539Control_history1$endDay":     str(end.day),
-                # 查詢按鈕
-                "D539Control_history1$btnSubmit":  "查詢",
-            }
-
-            post_kw = {"impersonate": _IMPERSONATE} if _USE_CFFI else {}
-            r2 = session.post(self.URL, data=post_data, headers=_HEADERS, timeout=20, **post_kw)
-            r2.raise_for_status()
-            soup2 = BeautifulSoup(r2.text, "lxml")
-            results = self._parse_table(soup2, count)
-
-            if not results:
-                print(
-                    "  [539] 查詢成功但解析不到資料，官網可能已改版。\n"
-                    "  → 請手動把資料填入 data/lottery539.json"
-                )
-            return results
-
-        except Exception as exc:
-            print(
-                f"  [539] 爬蟲失敗：{exc}\n"
-                "  → 請手動把資料填入 data/lottery539.json"
-            )
-            return []
-
-    @staticmethod
-    def _field(soup, name: str) -> str:
-        tag = soup.find("input", {"name": name})
-        return tag["value"] if tag else ""
-
-    def _parse_table(self, soup, count: int) -> list[dict]:
-        # 嘗試多種 table 選擇器
-        table = (
-            soup.find("table", id=re.compile(r"history", re.I)) or
-            soup.find("table", class_=re.compile(r"table_history|tblHistory", re.I))
-        )
-        if not table:
-            for t in soup.find_all("table"):
-                if "期別" in t.get_text() or "開獎號碼" in t.get_text():
-                    table = t
-                    break
-        if not table:
-            return []
-
-        draws = []
-        for row in table.find_all("tr")[1:]:
-            d = self._parse_row(row)
-            if d:
-                draws.append(d)
-            if len(draws) >= count:
-                break
-        return draws
-
-    def _parse_row(self, row) -> dict | None:
-        cells = [c.get_text(strip=True) for c in row.find_all("td")]
-        if len(cells) < 3:
-            return None
-        try:
-            period = int(re.sub(r"\D", "", cells[0]))
-            roc_parts = re.findall(r"\d+", cells[1])
-            if len(roc_parts) < 3:
-                return None
-            year  = int(roc_parts[0]) + 1911
-            month = int(roc_parts[1])
-            day   = int(roc_parts[2])
-            draw_date = f"{year:04d}-{month:02d}-{day:02d}"
-
-            # 嘗試從各 td 直接讀號碼
-            nums: list[int] = []
-            if len(cells) >= 7:
-                for i in range(2, 7):
-                    if cells[i].isdigit() and 1 <= int(cells[i]) <= 39:
-                        nums.append(int(cells[i]))
-            # 若讀不到，從 cells[2] 用 regex 撈
-            if len(nums) != 5:
-                raw = " ".join(cells[2:7])
-                nums = [
-                    int(x) for x in re.findall(r"\b([1-9]|[1-3]\d)\b", raw)
-                    if 1 <= int(x) <= 39
-                ]
-            numbers = sorted(set(nums))[:5]
+            period  = int(item["period"])
+            raw_date = item["lotteryDate"][:10]   # "2026-05-15T..."
+            numbers = sorted(int(n) for n in item["drawNumberSize"] if 1 <= int(n) <= 39)
             if len(numbers) != 5:
                 return None
-            return {"date": draw_date, "period": period, "numbers": numbers}
-        except (ValueError, IndexError):
+            return {"date": raw_date, "period": period, "numbers": numbers}
+        except (KeyError, ValueError, TypeError):
             return None
+
