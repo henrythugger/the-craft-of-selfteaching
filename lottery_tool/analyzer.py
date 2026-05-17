@@ -151,19 +151,22 @@ def _drag_analysis(draws: list[dict]) -> dict:
         if not runs:
             continue
 
-        last_run = runs[-1]
-        last_run_end = last_run[-1]
+        # runs 是按 index 由小到大排列（index 小 = 最新期）
+        # 取「最近一段」連拖：runs[0] 是最新的連拖段
+        recent_run      = runs[0]
+        recent_run_start = recent_run[0]   # 連拖中最新期的 index
+        recent_run_end   = recent_run[-1]  # 連拖中最舊期的 index
 
-        if last_run_end == 0:
-            # 最新期還在拖
+        if recent_run_start == 0:
+            # 連拖段包含最新期 → 目前在拖
             currently_dragging.append({
                 "number":              n,
-                "consecutive_periods": len(last_run),
+                "consecutive_periods": len(recent_run),
                 "last_seen":           draws[0]["date"],
             })
-        elif last_run_end <= 5:
-            # 最近 5 期內斷拖 → 可能回馬槍
-            stopped_ago = last_run_end  # index 就是距今幾期
+        elif recent_run_start <= 5:
+            # 連拖段在最近 5 期內斷拖 → 可能回馬槍
+            stopped_ago = recent_run_start  # 距今幾期前斷拖
             if stopped_ago <= 3:
                 risk = "high"
             elif stopped_ago <= 5:

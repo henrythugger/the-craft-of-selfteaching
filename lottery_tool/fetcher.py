@@ -10,9 +10,19 @@
 
 import re
 import json
-import requests
 from datetime import date, timedelta
 from bs4 import BeautifulSoup
+
+# 優先使用 curl-cffi（模擬真實瀏覽器 TLS 指紋，繞過部分反爬蟲）
+# 若未安裝則退回標準 requests
+try:
+    from curl_cffi import requests
+    _IMPERSONATE = "chrome"   # 模擬 Chrome 的 TLS/HTTP2 指紋
+    _USE_CFFI = True
+except ImportError:
+    import requests
+    _IMPERSONATE = None
+    _USE_CFFI = False
 
 _HEADERS = {
     "User-Agent": (
@@ -22,7 +32,26 @@ _HEADERS = {
     ),
     "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7",
     "Accept": "application/json, text/html, */*",
+    "Referer": "https://www.google.com/",
 }
+
+
+def _get(url, **kwargs):
+    """統一 GET，自動使用 curl-cffi 或 requests"""
+    if _USE_CFFI:
+        return requests.get(url, headers=_HEADERS, impersonate=_IMPERSONATE,
+                            timeout=15, **kwargs)
+    return requests.get(url, headers=_HEADERS, timeout=15, **kwargs)
+
+
+def _session():
+    """建立 Session（curl-cffi 或 requests 均相容）"""
+    if _USE_CFFI:
+        return requests.Session()
+    import requests as _req
+    s = _req.Session()
+    s.headers.update(_HEADERS)
+    return s
 
 
 # ─────────────────────────────────────────────
@@ -49,7 +78,7 @@ class Fantasy5Fetcher:
         while len(draws) < count:
             try:
                 url = self.API.format(page=page)
-                r = requests.get(url, headers=_HEADERS, timeout=15)
+                r = _get(url)
                 r.raise_for_status()
                 items = r.json().get("DrawHistory") or r.json().get("drawHistory") or []
                 if not items:
@@ -78,7 +107,7 @@ class Fantasy5Fetcher:
 
     def _html_fallback(self, count: int) -> list[dict]:
         try:
-            r = requests.get(self.HTML_URL, headers=_HEADERS, timeout=15)
+            r = _get(self.HTML_URL)
             r.raise_for_status()
             soup = BeautifulSoup(r.text, "lxml")
             draws = []
@@ -136,10 +165,11 @@ class Lottery539Fetcher:
         end   = date.today()
         start = end - timedelta(days=count + 15)  # 多抓幾天，扣掉非開獎日
 
-        session = requests.Session()
+        session = _session()
         try:
             # Step 1: GET 取得 ASP.NET 隱藏欄位
-            r = session.get(self.URL, headers=_HEADERS, timeout=15)
+            get_kw = {"impersonate": _IMPERSONATE} if _USE_CFFI else {}
+            r = session.get(self.URL, headers=_HEADERS, timeout=15, **get_kw)
             r.raise_for_status()
             soup = BeautifulSoup(r.text, "lxml")
 
@@ -163,7 +193,8 @@ class Lottery539Fetcher:
                 "D539Control_history1$btnSubmit":  "查詢",
             }
 
-            r2 = session.post(self.URL, data=post_data, headers=_HEADERS, timeout=20)
+            post_kw = {"impersonate": _IMPERSONATE} if _USE_CFFI else {}
+            r2 = session.post(self.URL, data=post_data, headers=_HEADERS, timeout=20, **post_kw)
             r2.raise_for_status()
             soup2 = BeautifulSoup(r2.text, "lxml")
             results = self._parse_table(soup2, count)
