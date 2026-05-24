@@ -1,9 +1,15 @@
 """
-六維度版路分析引擎
+六維度版路分析引擎（整合專家版路表）
 適用於任何 1-39 選 5 的彩種（Fantasy 5 / 今彩539）
+
+專家表權重最高：
+  圖1 精準尾數表 — 依開獎日鎖定主尾/高機率尾
+  圖2 1拖3固定拖牌法 — 上期號碼的固定拖牌候選池
 """
 
 from collections import Counter, defaultdict
+from datetime import date, timedelta
+from expert_tables import get_tail_rule, get_drag_candidates, DRAG_TABLE
 
 
 # ── 工具 ──────────────────────────────────────
@@ -20,36 +26,58 @@ def _zone(n: int) -> str:
 def analyze(draws: list[dict], game_range: int = 39) -> dict:
     """
     draws: 依期號由新到舊排序的開獎資料清單
-    回傳完整六維度分析結果 dict
+    回傳完整六維度 + 專家表分析結果 dict
     """
     if not draws:
         return {}
 
     n_draws = len(draws)
 
-    # ① 尾數統計
-    tail_result = _tail_analysis(draws)
+    # ─── 專家表分析（最高權重）───────────────────
+    latest_date   = draws[0]["date"]
+    last_numbers  = draws[0]["numbers"]
 
-    # ② 遺漏分析
+    # 推算「下一期」的開獎日（+1天，實際可依彩種調整）
+    next_date = (date.fromisoformat(latest_date) + timedelta(days=1)).isoformat()
+
+    # 圖1：依下期日期鎖定主尾/高機率尾
+    tail_rule     = get_tail_rule(next_date)
+
+    # 圖2：上期號碼的固定拖牌候選
+    drag_expert   = get_drag_candidates(last_numbers)
+
+    expert_result = {
+        "next_draw_date":   next_date,
+        "tail_rule": {
+            "day_digit":  int(next_date.split("-")[2]) % 10,
+            "main_tails": tail_rule.get("main", []),
+            "high_tails": tail_rule.get("high", []),
+        },
+        "drag_1to3": {
+            "last_numbers":  last_numbers,
+            "candidates":    drag_expert["candidates"],
+            "freq":          drag_expert["freq"],
+            "sources":       drag_expert["sources"],
+        },
+    }
+
+    # ─── 六維度分析 ──────────────────────────────
+    tail_result    = _tail_analysis(draws)
     missing_result = _missing_analysis(draws, game_range)
+    drag_result    = _drag_analysis(draws)
+    zone_result    = _zone_analysis(draws)
+    oe_result      = _odd_even_analysis(draws)
 
-    # ③ 拖牌偵測
-    drag_result = _drag_analysis(draws)
-
-    # ④ 區間分布
-    zone_result = _zone_analysis(draws)
-
-    # ⑤ 單雙比
-    oe_result = _odd_even_analysis(draws)
-
-    # ⑥ 綜合推薦
-    recs = _recommend(tail_result, missing_result, drag_result, zone_result, oe_result)
+    # ⑥ 綜合推薦（傳入專家表結果）
+    recs = _recommend(tail_result, missing_result, drag_result,
+                      zone_result, oe_result, expert_result)
 
     return {
         "summary": {
             "total_periods": n_draws,
             "date_range": {"from": draws[-1]["date"], "to": draws[0]["date"]},
         },
+        "expert":   expert_result,
         "tail":     tail_result,
         "missing":  missing_result,
         "drag":     drag_result,
@@ -261,52 +289,44 @@ def _odd_even_analysis(draws: list[dict]) -> dict:
 
 
 # ── ⑥ 綜合推薦 ───────────────────────────────
-def _recommend(tail, missing, drag, zone, odd_even) -> list[dict]:
+def _recommend(tail, missing, drag, zone, odd_even, expert=None) -> list[dict]:
     """
-    根據前五維分析，產生 3 組推薦號碼。
-    策略：
-      組1 — 熱尾長遺漏（回補主力）
-      組2 — 冷尾爆發 + 回馬槍
-      組3 — 均衡穩健（各區平衡）
+    產生 3 組推薦號碼，專家表（圖1+圖2）為最高權重。
+      組1 — 圖2拖牌候選 × 圖1尾數過濾（雙表交叉）
+      組2 — 圖2拖牌候選 × 遺漏補回
+      組3 — 圖1尾數 × 遺漏長期未出
     """
-    hot_tails  = {t for t, v in tail.items() if v["status"] == "hot"}
-    cold_tails = {t for t, v in tail.items() if v["status"] == "cold" and v["comeback_signal"]}
-
-    # 所有號碼依遺漏排序
     by_missing = sorted(missing.items(), key=lambda x: -x[1]["missing_periods"])
+    fallback   = [n for n, _ in by_missing]
 
-    # 高回馬槍號碼
-    comeback_nums = {d["number"] for d in drag["recently_stopped"] if d["comeback_risk"] == "high"}
+    # ── 專家表資料 ──
+    expert_tails   = set()   # 圖1：允許的尾數
+    drag_cands     = []      # 圖2：拖牌候選（依頻率排序）
+    drag_freq: dict[int, int] = {}
 
-    # ── 組1：熱尾 + 最長遺漏 ──
-    set1 = _pick_set(
-        candidates=[n for n, v in by_missing if v["tail"] in hot_tails],
-        n=5,
-        fallback=[n for n, _ in by_missing],
-    )
+    if expert:
+        rule = expert.get("tail_rule", {})
+        expert_tails = set(rule.get("main_tails", []) + rule.get("high_tails", []))
+        d1to3 = expert.get("drag_1to3", {})
+        drag_cands = d1to3.get("candidates", [])
+        drag_freq  = d1to3.get("freq", {})
 
-    # ── 組2：冷尾爆發 + 回馬槍 ──
-    cold_tail_nums = [n for n, v in by_missing if v["tail"] in cold_tails]
-    merged = list(dict.fromkeys(cold_tail_nums + list(comeback_nums)))
-    set2 = _pick_set(
-        candidates=merged,
-        n=5,
-        fallback=[n for n, _ in by_missing],
-        exclude=set(set1),
-    )
+    # ── 組1：圖2拖牌 × 圖1尾數（雙重過濾，最精準）──
+    set1_pool = [n for n in drag_cands if (_tail(n) in expert_tails)] if expert_tails else drag_cands
+    set1 = _pick_set(set1_pool, 5, fallback=drag_cands or fallback)
 
-    # ── 組3：均衡（低中高各約 1-2 顆） ──
-    lo_cands = sorted([n for n, v in by_missing if _zone(n) == "low"],  key=lambda x: -missing[x]["missing_periods"])
-    mi_cands = sorted([n for n, v in by_missing if _zone(n) == "mid"],  key=lambda x: -missing[x]["missing_periods"])
-    hi_cands = sorted([n for n, v in by_missing if _zone(n) == "high"], key=lambda x: -missing[x]["missing_periods"])
+    # ── 組2：圖2拖牌 × 遺漏補回（拖牌中找久未出的）──
+    drag_by_miss = sorted(drag_cands, key=lambda x: -missing.get(x, {}).get("missing_periods", 0))
+    set2 = _pick_set(drag_by_miss, 5, fallback=fallback, exclude=set(set1))
 
-    set3_raw = (lo_cands[:2] + mi_cands[:2] + hi_cands[:2])
-    set3 = _pick_set(candidates=set3_raw, n=5, fallback=[n for n, _ in by_missing])
+    # ── 組3：圖1尾數 × 最長遺漏（純尾數策略）──
+    tail_filtered = [n for n, v in by_missing if v["tail"] in expert_tails] if expert_tails else fallback
+    set3 = _pick_set(tail_filtered, 5, fallback=fallback, exclude=set(set1) | set(set2))
 
     return [
-        _build_rec(1, sorted(set1), "熱尾長遺漏回補", missing),
-        _build_rec(2, sorted(set2), "冷尾爆發＋回馬槍", missing),
-        _build_rec(3, sorted(set3), "低中高均衡", missing),
+        _build_rec(1, sorted(set1), "圖2拖牌×圖1尾數（雙表交叉）", missing),
+        _build_rec(2, sorted(set2), "圖2拖牌×遺漏補回",             missing),
+        _build_rec(3, sorted(set3), "圖1尾數×最長遺漏",             missing),
     ]
 
 
