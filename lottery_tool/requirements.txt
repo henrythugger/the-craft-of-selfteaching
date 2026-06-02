@@ -1,0 +1,6 @@
+requests>=2.31.0
+beautifulsoup4>=4.12.0
+lxml>=5.1.0
+curl-cffi>=0.7.0
+# 539 使用台灣彩券官方 JSON API，不需額外套件
+# Fantasy 5 使用 calottery.com（HTML fallback 需要 beautifulsoup4）
